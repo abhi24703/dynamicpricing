@@ -1,0 +1,301 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import mean_squared_error, r2_score
+import xgboost as xgb
+
+# Function to preprocess the dataset
+def preprocess_data(df):
+    """
+    Preprocess the hotel dataset for model training
+    """
+    # Make a copy to avoid modifying the original dataframe
+    df_processed = df.copy()
+    
+    # Define features and target
+    X = df_processed[['Day_of_Week', 'Is_Weekend', 'Is_Holiday', 'Occupancy_Rate', 'Competitor_Price']]
+    y = df_processed['Room_Price']
+    
+    # One-hot encode Day_of_Week without dropping the first category
+    encoder = OneHotEncoder(sparse_output=False, drop=None)
+    encoded_days = encoder.fit_transform(X[['Day_of_Week']])
+    
+    # Create feature names for encoded days with day names
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    day_columns = [f"Day_{day}" for day in day_names]
+    encoded_df = pd.DataFrame(encoded_days, columns=day_columns)
+    
+    # Combine with numerical features
+    numerical_features = ['Is_Weekend', 'Is_Holiday', 'Occupancy_Rate', 'Competitor_Price']
+    
+    X_processed = pd.concat([encoded_df.reset_index(drop=True), 
+                           X[numerical_features].reset_index(drop=True)], axis=1)
+    
+    # Scale numerical features
+    scaler = StandardScaler()
+    X_processed[numerical_features] = scaler.fit_transform(X_processed[numerical_features])
+    
+    return X_processed, y, scaler, numerical_features, day_columns, encoder, day_names
+
+# Train XGBoost model
+def train_xgboost_model(X_train, y_train, X_test, y_test):
+    """
+    Train an XGBoost model for hotel price prediction
+    """
+    # Define XGBoost parameters
+    params = {
+        'objective': 'reg:squarederror',
+        'learning_rate': 0.1,
+        'max_depth': 6,
+        'min_child_weight': 1,
+        'subsample': 0.8,
+        'colsample_bytree': 0.8,
+        'n_estimators': 200,
+        'random_state': 42
+    }
+    
+    # Train the model
+    model = xgb.XGBRegressor(**params)
+    model.fit(X_train, y_train)
+    
+    # Evaluate model performance
+    y_pred = model.predict(X_test)
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    r2 = r2_score(y_test, y_pred)
+    
+    print(f"Model Performance:")
+    print(f"RMSE: ₹{rmse:.2f}")
+    print(f"R² Score: {r2:.4f}")
+    
+    return model
+
+# Create a price prediction function with occupancy-based pricing tiers
+def predict_price(model, scaler, params, numerical_features, day_columns, day_names):
+    """
+    Predict room price based on input parameters with direct competitor price impact
+    and occupancy-based pricing tiers
+    """
+    # Get the base prediction from the model
+    # Create dataframe with input parameters
+    input_df = pd.DataFrame([params])
+    
+    # One-hot encode Day_of_Week
+    day_columns_df = pd.DataFrame(columns=day_columns)
+    day_columns_df.loc[0] = 0  # Initialize with zeros
+    
+    # Convert day name or number to index
+    if isinstance(params['Day_of_Week'], str):
+        # If day is provided as a name
+        day_name = params['Day_of_Week']
+        day_index = day_names.index(day_name)
+    else:
+        # If day is provided as a number (1-7)
+        day_index = params['Day_of_Week'] - 1  # Adjust for 0-based indexing
+    
+    # Set the corresponding day column to 1
+    day_columns_df.iloc[0, day_index] = 1
+    
+    # Extract numerical features
+    numerical_df = input_df[numerical_features].copy()
+    
+    # Scale numerical features
+    numerical_df_scaled = pd.DataFrame(
+        scaler.transform(numerical_df),
+        columns=numerical_features
+    )
+    
+    # Combine features in the same order as during training
+    final_input = pd.concat([
+        day_columns_df.reset_index(drop=True), 
+        numerical_df_scaled.reset_index(drop=True)
+    ], axis=1)
+    
+    # Make base prediction
+    prediction = model.predict(final_input)[0]
+    
+    # Apply direct competitor price influence (REDUCED FROM 0.25 TO 0.10)
+    if params['Competitor_Price'] != 8000:  # If not the base price
+        base_competitor_price = 8000
+        competitor_price_ratio = params['Competitor_Price'] / base_competitor_price
+        competitor_price_influence = (competitor_price_ratio - 1) * 0.10  # Reduced from 25% to 10% of the relative change
+        prediction = prediction * (1 + competitor_price_influence)
+    
+    # Apply occupancy-based pricing tiers (ALL VALUES REDUCED)
+    occupancy_tiers = {
+        0.9: 0.15,    # Reduced from 40% to 15% price premium at 90%+ occupancy
+        0.8: 0.10,    # Reduced from 25% to 10% price premium at 80-90% occupancy
+        0.7: 0.06,    # Reduced from 15% to 6% price premium at 70-80% occupancy
+        0.5: 0,       # No change at 50-70% occupancy
+        0.3: -0.05,   # Reduced from 10% to 5% discount at 30-50% occupancy
+        0.0: -0.12    # Reduced from 25% to 12% discount below 30% occupancy
+    }
+    
+    # Apply occupancy tier adjustment
+    current_occupancy = params['Occupancy_Rate']
+    for threshold, adjustment in sorted(occupancy_tiers.items(), reverse=True):
+        if current_occupancy >= threshold:
+            prediction = prediction * (1 + adjustment)
+            break
+    
+    return prediction
+
+# Modified test case function to demonstrate occupancy tiers
+# Modified test case function to demonstrate occupancy tiers
+def test_case(model, scaler, numerical_features, day_columns, day_names):
+    """
+    Test a single case with varying parameters to show price changes
+    """
+    # Base parameters
+    base_params = {
+        'Day_of_Week': 'Tuesday',  # Now using actual day name
+        'Is_Weekend': 0,
+        'Is_Holiday': 0,
+        'Occupancy_Rate': 0.5,  # Base occupancy at 50%
+        'Competitor_Price': 8000
+    }
+    
+    # Predict base price
+    base_price = predict_price(model, scaler, base_params, numerical_features, day_columns, day_names)
+    print(f"\nBase Test Case:")
+    print(f"Parameters: {base_params}")
+    print(f"Predicted Price: ₹{base_price:.2f}")
+    
+    # Test all days of the week
+    print("\nDay of Week Impact:")
+    for day in day_names:
+        day_params = base_params.copy()
+        day_params['Day_of_Week'] = day
+        day_price = predict_price(model, scaler, day_params, numerical_features, day_columns, day_names)
+        price_diff = day_price - base_price
+        price_pct = (price_diff / base_price) * 100
+        print(f"{day}: ₹{day_price:.2f}, Difference: ₹{price_diff:.2f} ({price_pct:.1f}%)")
+    
+    # Test different occupancy tiers
+    occupancy_levels = [0.25, 0.45, 0.65, 0.75, 0.85, 0.95]
+    
+    print("\nOccupancy-Based Pricing Tests:")
+    for occ in occupancy_levels:
+        test_params = base_params.copy()
+        test_params['Occupancy_Rate'] = occ
+        test_price = predict_price(model, scaler, test_params, numerical_features, day_columns, day_names)
+        price_diff = test_price - base_price
+        price_pct = (price_diff / base_price) * 100
+        
+        # Determine which tier was applied
+        tier_applied = None
+        # Updated tiers to match the modified predict_price function
+        occupancy_tiers = {0.9: 0.15, 0.8: 0.10, 0.7: 0.06, 0.5: 0, 0.3: -0.05, 0.0: -0.12}
+        for threshold, adjustment in sorted(occupancy_tiers.items(), reverse=True):
+            if occ >= threshold:
+                tier_applied = f"{adjustment*100:+.0f}% (≥{threshold*100:.0f}% occupancy)"
+                break
+                
+        print(f"Occupancy {occ*100:.0f}%: ₹{test_price:.2f}, " 
+              f"Difference: ₹{price_diff:.2f} ({price_pct:.1f}%), "
+              f"Tier Applied: {tier_applied}")
+    
+    # Continue with other tests
+    # Test 1: Weekend
+    weekend_params = base_params.copy()
+    weekend_params['Day_of_Week'] = 'Saturday'
+    weekend_params['Is_Weekend'] = 1
+    weekend_price = predict_price(model, scaler, weekend_params, numerical_features, day_columns, day_names)
+    print(f"\nWeekend Change:")
+    print(f"Parameters: {weekend_params}")
+    print(f"Predicted Price: ₹{weekend_price:.2f}")
+    price_diff = weekend_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+    
+    # Test 2: High occupancy at 90%
+    high_occupancy_params = base_params.copy()
+    high_occupancy_params['Occupancy_Rate'] = 0.9
+    high_occupancy_price = predict_price(model, scaler, high_occupancy_params, numerical_features, day_columns, day_names)
+    print(f"\nHigh Occupancy Change (90%):")
+    print(f"Parameters: {high_occupancy_params}")
+    print(f"Predicted Price: ₹{high_occupancy_price:.2f}")
+    price_diff = high_occupancy_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+    
+    low_occupancy_params = base_params.copy()
+    low_occupancy_params['Occupancy_Rate'] = 0.3
+    low_occupancy_price = predict_price(model, scaler, low_occupancy_params, numerical_features, day_columns, day_names)
+    print(f"\nLow Occupancy Change (30%):")
+    print(f"Parameters: {low_occupancy_params}")
+    print(f"Predicted Price: ₹{low_occupancy_price:.2f}")
+    price_diff = low_occupancy_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+
+    # Test 3: High competitor price
+    high_competitor_params = base_params.copy()
+    high_competitor_params['Competitor_Price'] = 12000
+    high_competitor_price = predict_price(model, scaler, high_competitor_params, numerical_features, day_columns, day_names)
+    print(f"\nHigh Competitor Price Change:")
+    print(f"Parameters: {high_competitor_params}")
+    print(f"Predicted Price: ₹{high_competitor_price:.2f}")
+    price_diff = high_competitor_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+    
+    # Test 4: Holiday
+    holiday_params = base_params.copy()
+    holiday_params['Is_Holiday'] = 1
+    holiday_price = predict_price(model, scaler, holiday_params, numerical_features, day_columns, day_names)
+    print(f"\nHoliday Change:")
+    print(f"Parameters: {holiday_params}")
+    print(f"Predicted Price: ₹{holiday_price:.2f}")
+    price_diff = holiday_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+    
+    # Test 5: Combined factors (weekend + holiday + high occupancy)
+    combined_params = base_params.copy()
+    combined_params['Day_of_Week'] = 'Saturday'
+    combined_params['Is_Weekend'] = 1
+    combined_params['Is_Holiday'] = 1
+    combined_params['Occupancy_Rate'] = 0.9
+    combined_price = predict_price(model, scaler, combined_params, numerical_features, day_columns, day_names)
+    print(f"\nCombined Factors (Weekend + Holiday + High Occupancy):")
+    print(f"Parameters: {combined_params}")
+    print(f"Predicted Price: ₹{combined_price:.2f}")
+    price_diff = combined_price - base_price
+    print(f"Price Difference: ₹{price_diff:.2f} ({(price_diff / base_price) * 100:.1f}%)")
+def main(data_path):
+    """
+    Main function to load data, train the model and test a case
+    """
+    # Load data
+    hotel_data = pd.read_csv(data_path)
+    
+    # Preprocess data
+    X_processed, y, scaler, numerical_features, day_columns, encoder, day_names = preprocess_data(hotel_data)
+    
+    # Split data
+    X_train, X_test, y_train, y_test = train_test_split(X_processed, y, test_size=0.2, random_state=42)
+    
+    # Train model
+    model = train_xgboost_model(X_train, y_train, X_test, y_test)
+    
+    # Feature importance
+    feature_importance = pd.DataFrame({
+        'Feature': X_processed.columns,
+        'Importance': model.feature_importances_
+    }).sort_values('Importance', ascending=False)
+    
+    print("\nFeature Importance:")
+    print(feature_importance)
+    
+    # Run test case
+    test_case(model, scaler, numerical_features, day_columns, day_names)
+    
+    return model, scaler, numerical_features, day_columns, day_names
+
+# Run the code
+if __name__ == "__main__":
+    import sys
+    data_path = sys.argv[1] if len(sys.argv) > 1 else r"C:\Users\SHIVA KUMAR\Downloads\synthetic_hotel_pricing_data.csv"
+    model, scaler, numerical_features, day_columns, day_names = main(data_path)
+    import joblib
+joblib.dump(model, 'hotel_pricing_model.pkl')
+joblib.dump(scaler, 'price_scaler.pkl')
+joblib.dump((numerical_features, day_columns, day_names), 'model_metadata.pkl')
